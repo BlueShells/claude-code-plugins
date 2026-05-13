@@ -19,10 +19,14 @@ import {
   chmodSync,
   mkdirSync,
   readFileSync,
+  readdirSync,
+  statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
+import { spawn } from "node:child_process";
 
 // ---------------------------------------------------------------------------
 // Profile-gated startup: FEISHU_PROFILE must be set to activate the channel.
@@ -31,6 +35,32 @@ import { join } from "node:path";
 // ---------------------------------------------------------------------------
 const FEISHU_PROFILE = process.env.FEISHU_PROFILE ?? "";
 const CHANNEL_ACTIVE = FEISHU_PROFILE !== "";
+
+// CLAUDE_TTY_INJECT: when set, Feishu inbound messages also get keystroke-injected
+// into the Claude Code TTY so they actually drive the prompt (not just channel
+// notifications that get rendered as side-channel events). Without this, Claude
+// Code 2.1.x channel mode treats Feishu messages as out-of-band notifications and
+// doesn't react. Format:
+//   screen:<session>   e.g. screen:claude (run inside `screen -S claude`)
+//   tmux:<target>      e.g. tmux:work:0.0 or tmux:work
+//   ""                 (default) disabled — keeps prior behavior
+const CLAUDE_TTY_INJECT = process.env.CLAUDE_TTY_INJECT ?? "";
+
+// FEISHU_IMAGE_DIR: when set, inbound image messages are downloaded to this
+// directory so Claude can Read() them. Unset = disabled (image messages keep
+// emitting "(image message)" as before — back-compat). The actual files live
+// in a plugin-owned subdirectory "feishu-channel-cache" so cleanup never
+// touches unrelated files even if the user points this at a shared root.
+const FEISHU_IMAGE_DIR_RAW = process.env.FEISHU_IMAGE_DIR ?? "";
+const FEISHU_IMAGE_ENABLED = FEISHU_IMAGE_DIR_RAW !== "";
+const FEISHU_IMAGE_DIR = FEISHU_IMAGE_DIR_RAW
+  ? join(FEISHU_IMAGE_DIR_RAW, "feishu-channel-cache")
+  : "";
+const FEISHU_IMAGE_TTL_HOURS = Number(process.env.FEISHU_IMAGE_TTL_HOURS ?? "24");
+// TTY injection has hard length limits (screen "stuff" docs explicitly warn
+// against large buffers). We cap the body and append a "[truncated]" marker
+// so users know to switch to terminal for the rest.
+const TTY_INJECT_MAX_BYTES = Number(process.env.FEISHU_TTY_INJECT_MAX_BYTES ?? "1500");
 
 const STATE_DIR =
   process.env.FEISHU_STATE_DIR ??
@@ -65,6 +95,7 @@ function shutdown() {
   try {
     if (wsClient && typeof wsClient.stop === "function") wsClient.stop();
   } catch {}
+  try { stopImageCleanupLoop(); } catch {}
   // Force exit after a short grace period — don't let dangling connections
   // keep the process alive.
   setTimeout(() => process.exit(0), 500);
@@ -480,6 +511,10 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
 await mcp.connect(new StdioServerTransport());
 fileLog("mcp transport connected");
 
+// Kick off periodic image-cache cleanup. No-op when FEISHU_IMAGE_DIR isn't set,
+// so it stays back-compat for users who never enable image download.
+startImageCleanupLoop();
+
 if (CHANNEL_ACTIVE && client && wsClient) {
 // Wait for Claude Code to finish MCP initialization (listTools, etc.)
 // before connecting to Feishu, so the first inbound message isn't lost.
@@ -581,7 +616,21 @@ const dispatcher = new lark.EventDispatcher({
         }
       }
 
-      const content = formatMessageContent(message.message_type, rawContent);
+      // For image messages, download the binary first so Claude can Read() the
+      // file. Synchronous to the notification path: a failed download falls
+      // back to the plain "(image message)" text so the channel notification
+      // is never lost. Gated by FEISHU_IMAGE_ENABLED so unset env = back-compat.
+      let content = formatMessageContent(message.message_type, rawContent);
+      if (FEISHU_IMAGE_ENABLED && String(message.message_type ?? "") === "image") {
+        const imageKey = extractImageKey(rawContent);
+        if (imageKey && messageId) {
+          const localPath = await downloadFeishuImage(messageId, imageKey);
+          if (localPath) {
+            content = `[飞书图片已下载到 ${localPath}，请用 Read 工具查看]`;
+          }
+        }
+      }
+
       const userName =
         event?.sender?.sender_id?.open_id ??
         event?.sender?.sender_id?.user_id ??
@@ -612,6 +661,17 @@ const dispatcher = new lark.EventDispatcher({
           senderOpenId || "unknown"
         }`
       );
+
+      // Optionally inject into the Claude Code TTY so the message becomes a
+      // real user prompt (not just a side-channel notification). Disabled by
+      // default — see CLAUDE_TTY_INJECT comment near the top of the file.
+      if (CLAUDE_TTY_INJECT) {
+        // Fire-and-forget but with awaited internal ordering so screen/tmux
+        // delivery is atomic (text then Enter, not racing).
+        injectToTTY(content)
+          .then(() => fileLog(`tty inject attempted via ${CLAUDE_TTY_INJECT}`))
+          .catch((e) => fileLog(`tty inject rejected: ${String(e)}`));
+      }
 
       // Add "GET" reaction as a read receipt; store reaction_id for removal on reply.
       if (messageId) {
@@ -795,6 +855,237 @@ function shouldDeliver(senderId: string, allowFrom: string[], strict: boolean): 
   if (allowFrom.includes(senderId)) return true;
   if (strict) return false;
   return allowFrom.length === 0;
+}
+
+// ---------------------------------------------------------------------------
+// TTY injection: optionally keystroke the inbound text into the Claude Code
+// terminal so it actually drives the prompt (vs being just a channel
+// notification that Claude only "reads" out-of-band).
+//
+// Limitations: the message body is best-effort plaintext. We strip control
+// characters and collapse newlines to spaces; users sending shell-meta-rich
+// text should not expect perfect fidelity. Default is disabled.
+// ---------------------------------------------------------------------------
+const TTY_TRUNCATE_SUFFIX = " [truncated]";
+const TTY_TRUNCATE_SUFFIX_BYTES = Buffer.byteLength(TTY_TRUNCATE_SUFFIX, "utf8");
+
+function sanitizeForTTY(text: string): { body: string; truncated: boolean } {
+  // Drop \r, NUL, and other control chars; flatten newlines to space so a single
+  // CR at the end submits the whole line. screen(1) explicitly notes "you
+  // cannot paste large buffers with the 'stuff' command", and tmux has similar
+  // buffer limits — enforce a HARD byte cap (including the suffix) so partial
+  // delivery isn't silent and the final injected blob is never over budget.
+  const cleaned = text
+    .replace(/[\x00-\x08\x0B-\x1F\x7F]/g, "")
+    .replace(/\r?\n/g, " ");
+  if (Buffer.byteLength(cleaned, "utf8") <= TTY_INJECT_MAX_BYTES) {
+    return { body: cleaned, truncated: false };
+  }
+  const buf = Buffer.from(cleaned, "utf8");
+
+  // Edge case: if the max is so small the suffix alone doesn't fit, skip the
+  // marker entirely — better silent truncation than overshooting the hard cap.
+  // (Codex round 3 fix.)
+  if (TTY_INJECT_MAX_BYTES <= TTY_TRUNCATE_SUFFIX_BYTES) {
+    let body = buf.subarray(0, TTY_INJECT_MAX_BYTES).toString("utf8").replace(/�+$/u, "");
+    while (Buffer.byteLength(body, "utf8") > TTY_INJECT_MAX_BYTES && body.length > 0) {
+      body = body.slice(0, -1);
+    }
+    return { body, truncated: true };
+  }
+
+  // Normal path: reserve room for the suffix so the FINAL payload is still
+  // ≤ TTY_INJECT_MAX_BYTES (Codex round 2 fix).
+  const budget = TTY_INJECT_MAX_BYTES - TTY_TRUNCATE_SUFFIX_BYTES;
+  let body = buf.subarray(0, Math.min(buf.length, budget)).toString("utf8");
+  body = body.replace(/�+$/u, "");
+  while (Buffer.byteLength(body + TTY_TRUNCATE_SUFFIX, "utf8") > TTY_INJECT_MAX_BYTES && body.length > 0) {
+    body = body.slice(0, -1);
+  }
+  return { body: body + TTY_TRUNCATE_SUFFIX, truncated: true };
+}
+
+function runOnce(cmd: string, args: string[]): Promise<void> {
+  return new Promise((resolve) => {
+    try {
+      const child = spawn(cmd, args, { stdio: "ignore" });
+      child.on("error", (e) => {
+        fileLog(`tty inject ${cmd} spawn error: ${String(e)}`);
+        resolve();
+      });
+      child.on("exit", () => resolve());
+    } catch (e) {
+      fileLog(`tty inject ${cmd} threw: ${String(e)}`);
+      resolve();
+    }
+  });
+}
+
+async function injectToTTY(text: string): Promise<void> {
+  if (!CLAUDE_TTY_INJECT) return;
+  const colonIdx = CLAUDE_TTY_INJECT.indexOf(":");
+  if (colonIdx <= 0) {
+    fileLog(`CLAUDE_TTY_INJECT malformed (expected tool:session): ${CLAUDE_TTY_INJECT}`);
+    return;
+  }
+  const tool = CLAUDE_TTY_INJECT.slice(0, colonIdx);
+  const session = CLAUDE_TTY_INJECT.slice(colonIdx + 1);
+  const { body, truncated } = sanitizeForTTY(text);
+  if (!body) return;
+  if (truncated) {
+    fileLog(`tty inject truncated to ${TTY_INJECT_MAX_BYTES} bytes (original ${Buffer.byteLength(text, "utf8")}B)`);
+  }
+
+  try {
+    if (tool === "screen") {
+      // screen -X stuff has known buffer-size limits ("cannot paste large
+      // buffers"); we already cap body above. CR at the end submits.
+      await runOnce("screen", ["-S", session, "-X", "stuff", body + "\r"]);
+    } else if (tool === "tmux") {
+      // Two sequential send-keys: -l (literal) for the body, then Enter to
+      // submit. We MUST await between them so the literal text lands before
+      // Enter; otherwise tmux can process Enter first and submit empty.
+      await runOnce("tmux", ["send-keys", "-t", session, "-l", body]);
+      await runOnce("tmux", ["send-keys", "-t", session, "Enter"]);
+    } else {
+      fileLog(`CLAUDE_TTY_INJECT unsupported tool '${tool}' (expected 'screen' or 'tmux')`);
+    }
+  } catch (e) {
+    fileLog(`injectToTTY exception: ${String(e)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Inbound image cache: download image bytes from Feishu so Claude can Read()
+// them locally. Files live in a plugin-owned subdirectory
+// "feishu-channel-cache" under FEISHU_IMAGE_DIR so the cleanup loop can never
+// touch unrelated files even if the user picks a shared root path.
+// Enabled only when FEISHU_IMAGE_DIR env is explicitly set.
+// ---------------------------------------------------------------------------
+function ensureImageDir(): void {
+  if (!FEISHU_IMAGE_ENABLED) return;
+  try {
+    mkdirSync(FEISHU_IMAGE_DIR, { recursive: true, mode: 0o700 });
+  } catch {}
+}
+
+function cleanupOldImages(): void {
+  if (!FEISHU_IMAGE_ENABLED) return;
+  ensureImageDir();
+  const ttlMs = FEISHU_IMAGE_TTL_HOURS * 60 * 60 * 1000;
+  if (!Number.isFinite(ttlMs) || ttlMs <= 0) return;
+  const cutoff = Date.now() - ttlMs;
+  try {
+    // Only sweep our own cache subdir — never the parent FEISHU_IMAGE_DIR_RAW.
+    for (const name of readdirSync(FEISHU_IMAGE_DIR)) {
+      if (!name.startsWith("feishu_")) continue;
+      const path = join(FEISHU_IMAGE_DIR, name);
+      try {
+        const st = statSync(path);
+        if (st.mtimeMs < cutoff) unlinkSync(path);
+      } catch {}
+    }
+  } catch (e) {
+    fileLog(`cleanupOldImages failed: ${String(e)}`);
+  }
+}
+
+// Periodic cleanup: runs every hour while the channel is active, and an
+// immediate sweep on startup so a previously-aged-out tree doesn't linger.
+let imageCleanupTimer: ReturnType<typeof setInterval> | null = null;
+function startImageCleanupLoop(): void {
+  if (!FEISHU_IMAGE_ENABLED || imageCleanupTimer) return;
+  cleanupOldImages();
+  imageCleanupTimer = setInterval(() => {
+    try { cleanupOldImages(); } catch (e) { fileLog(`image cleanup tick failed: ${String(e)}`); }
+  }, 60 * 60 * 1000);
+  // Don't keep the process alive solely for the cleanup tick.
+  if (typeof imageCleanupTimer.unref === "function") imageCleanupTimer.unref();
+}
+function stopImageCleanupLoop(): void {
+  if (imageCleanupTimer) {
+    clearInterval(imageCleanupTimer);
+    imageCleanupTimer = null;
+  }
+}
+
+function extFromMimeOrDefault(mime: string | undefined): string {
+  switch ((mime ?? "").toLowerCase()) {
+    case "image/png":
+      return ".png";
+    case "image/jpeg":
+    case "image/jpg":
+      return ".jpg";
+    case "image/gif":
+      return ".gif";
+    case "image/webp":
+      return ".webp";
+    case "image/bmp":
+      return ".bmp";
+    default:
+      return ".jpg"; // Feishu most-common; lets Read() heuristics still work
+  }
+}
+
+async function downloadFeishuImage(
+  messageId: string,
+  fileKey: string,
+): Promise<string | null> {
+  if (!FEISHU_IMAGE_ENABLED) return null;
+  if (!messageId || !fileKey) return null;
+  ensureImageDir();
+  try {
+    // SDK signature: messageResource.get(payload) -> { writeFile, getReadableStream, headers }
+    // We use writeFile directly because it handles the stream-to-disk plumbing
+    // and is documented to support up to 100MB resources.
+    const res: any = await larkClient.im.messageResource.get({
+      path: { message_id: messageId, file_key: fileKey },
+      params: { type: "image" },
+    });
+    if (!res || typeof res.writeFile !== "function") {
+      fileLog(
+        `downloadFeishuImage unexpected SDK response messageId=${messageId} keys=${Object.keys(res ?? {}).join(",")}`,
+      );
+      return null;
+    }
+    const mime = res?.headers?.["content-type"] ?? "";
+    const ext = extFromMimeOrDefault(typeof mime === "string" ? mime : "");
+    const safeMsgId = messageId.replace(/[^A-Za-z0-9_-]/g, "_");
+    const safeKey = fileKey.replace(/[^A-Za-z0-9_-]/g, "_").slice(0, 16);
+    const path = join(FEISHU_IMAGE_DIR, `feishu_${safeMsgId}_${safeKey}${ext}`);
+    await res.writeFile(path);
+    let bytes = 0;
+    try {
+      bytes = statSync(path).size;
+    } catch {}
+    if (bytes <= 0) {
+      fileLog(`downloadFeishuImage zero-byte file messageId=${messageId} path=${path}`);
+      try { unlinkSync(path); } catch {}
+      return null;
+    }
+    fileLog(
+      `downloadFeishuImage saved messageId=${messageId} bytes=${bytes} path=${path}`,
+    );
+    return path;
+  } catch (e) {
+    fileLog(
+      `downloadFeishuImage failed messageId=${messageId} fileKey=${fileKey}: ${String(e)}`,
+    );
+    return null;
+  }
+}
+
+function extractImageKey(rawContent: unknown): string {
+  const content =
+    typeof rawContent === "object" && rawContent !== null
+      ? JSON.stringify(rawContent)
+      : String(rawContent ?? "");
+  try {
+    const parsed = JSON.parse(content);
+    return String(parsed?.image_key ?? "");
+  } catch {
+    return "";
+  }
 }
 
 function formatMessageContent(messageTypeRaw: unknown, contentRaw: unknown): string {
