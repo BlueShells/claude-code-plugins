@@ -3,3 +3,6 @@ node_modules/
 .env
 *.log
 .claude/
+# Local working backups created during patch sessions
+*.bak.*
+*.broken.*
