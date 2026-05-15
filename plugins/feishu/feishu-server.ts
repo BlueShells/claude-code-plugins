@@ -526,18 +526,36 @@ mcp.setNotificationHandler(PermissionRequestSchema, async ({ params }) => {
   }
 });
 
-await mcp.connect(new StdioServerTransport());
-fileLog("mcp transport connected");
 
+// === WS startup MOVED to BEFORE `await mcp.connect()` ===
+// bun has a non-deterministic scheduling bug where the microtask
+// continuation after `await mcp.connect()` can fail to execute (verified
+// via /proc/<pid>/fdinfo: bun parked in ep_poll, fileLog 'pre-WS gate'
+// never written even with empty image cache and patch in place). Running
+// WS startup pre-connect sidesteps the wedge entirely — WS is up before
+// mcp.connect binds stdio. The only mcp.notification() call (permission
+// verdict relay) is .catch()-voided, so the <10ms stdio-bind window is
+// safely covered. First Feishu event takes >100ms, well after connect.
+// Hoist before startImageCleanupLoop() call below — `let` is in TDZ until
+// its declaration line runs, so the call would throw ReferenceError when
+// FEISHU_IMAGE_ENABLED is true (the short-circuit `!FEISHU_IMAGE_ENABLED ||`
+// only saves us when image download is disabled).
+let imageCleanupTimer: ReturnType<typeof setInterval> | null = null;
 // Kick off periodic image-cache cleanup. No-op when FEISHU_IMAGE_DIR isn't set,
 // so it stays back-compat for users who never enable image download.
 startImageCleanupLoop();
 
+fileLog(`pre-WS gate: CHANNEL_ACTIVE=${CHANNEL_ACTIVE} client=${!!client} wsClient=${!!wsClient}`);
 if (CHANNEL_ACTIVE && client && wsClient) {
-// Wait for Claude Code to finish MCP initialization (listTools, etc.)
-// before connecting to Feishu, so the first inbound message isn't lost.
-await new Promise((r) => setTimeout(r, 2000));
-fileLog("post-connect delay done, starting WS client");
+// Previously: await new Promise((r) => setTimeout(r, 2000)) — meant as a
+// defensive delay to let Claude Code finish MCP initialization (listTools)
+// before WS starts. In practice this top-level await sometimes never resumes
+// in bun after mcp.connect's stdio transport binds (verified via
+// /proc/<pid>/fdinfo: no 2000ms timerfd armed, process parked in ep_poll).
+// We do NOT need the delay: Feishu's first event arrives 100ms+ after WS
+// handshake, well after Claude Code's listTools completes. Drop the delay
+// entirely so the inbound path is guaranteed to come up.
+fileLog("post-connect delay skipped, starting WS client immediately");
 
 const larkClient = client!;
 const larkWsClient = wsClient!;
@@ -634,17 +652,32 @@ const dispatcher = new lark.EventDispatcher({
         }
       }
 
-      // For image messages, download the binary first so Claude can Read() the
-      // file. Synchronous to the notification path: a failed download falls
-      // back to the plain "(image message)" text so the channel notification
-      // is never lost. Gated by FEISHU_IMAGE_ENABLED so unset env = back-compat.
+      // For image / post messages with embedded images, download the binary
+      // first so Claude can Read() the file. Synchronous to the notification
+      // path: a failed download falls back to the plain text so the channel
+      // notification is never lost. Gated by FEISHU_IMAGE_ENABLED.
       let content = formatMessageContent(message.message_type, rawContent);
-      if (FEISHU_IMAGE_ENABLED && String(message.message_type ?? "") === "image") {
-        const imageKey = extractImageKey(rawContent);
-        if (imageKey && messageId) {
-          const localPath = await downloadFeishuImage(messageId, imageKey);
-          if (localPath) {
-            content = `[飞书图片已下载到 ${localPath}，请用 Read 工具查看]`;
+      const msgType = String(message.message_type ?? "");
+      if (FEISHU_IMAGE_ENABLED && (msgType === "image" || msgType === "post") && messageId) {
+        const imageKeys = extractAllImageKeys(msgType, rawContent);
+        if (imageKeys.length > 0) {
+          const paths: string[] = [];
+          for (const k of imageKeys) {
+            const p = await downloadFeishuImage(messageId, k);
+            if (p) paths.push(p);
+          }
+          if (paths.length > 0) {
+            if (msgType === "image") {
+              content = `[飞书图片已下载到 ${paths[0]}，请用 Read 工具查看]`;
+            } else {
+              // For post: keep the user's text, replace (image) placeholders
+              // with concrete local paths so claude can Read() each one.
+              let idx = 0;
+              content = content.replace(/\(image\)/g, () => {
+                const p = paths[idx++] ?? "(image)";
+                return p === "(image)" ? p : `[飞书图片:${p}]`;
+              });
+            }
           }
         }
       }
@@ -685,9 +718,19 @@ const dispatcher = new lark.EventDispatcher({
       // default — see CLAUDE_TTY_INJECT comment near the top of the file.
       if (CLAUDE_TTY_INJECT) {
         // Fire-and-forget but with awaited internal ordering so screen/tmux
-        // delivery is atomic (text then Enter, not racing).
+        // delivery is atomic (text then Enter, not racing). On failure, log
+        // loudly AND tell the Feishu user (debounced) — silent drop is worse
+        // than annoying notifications because users wait for a reply that
+        // never comes.
         injectToTTY(content)
-          .then(() => fileLog(`tty inject attempted via ${CLAUDE_TTY_INJECT}`))
+          .then((r) => {
+            if (r.ok) {
+              fileLog(`tty inject succeeded via ${CLAUDE_TTY_INJECT}`);
+            } else {
+              fileLog(`tty inject FAILED via ${CLAUDE_TTY_INJECT}: ${r.reason}`);
+              notifyInjectFailure(chatId, r.reason ?? "unknown");
+            }
+          })
           .catch((e) => fileLog(`tty inject rejected: ${String(e)}`));
       }
 
@@ -817,6 +860,10 @@ process.stderr.write(`feishu channel [${FEISHU_PROFILE}]: websocket started\n`);
 // Send startup notification after WS client has connected (3s delay).
 setTimeout(notifyStartup, 3000);
 } // end if (CHANNEL_ACTIVE)
+
+await mcp.connect(new StdioServerTransport());
+fileLog("mcp transport connected");
+
 
 function loadDotEnv(filePath: string) {
   try {
@@ -968,54 +1015,118 @@ function sanitizeForTTY(text: string): { body: string; truncated: boolean } {
   return { body: body + TTY_TRUNCATE_SUFFIX, truncated: true };
 }
 
-function runOnce(cmd: string, args: string[]): Promise<void> {
+type RunResult = { code: number; stderr: string };
+
+function runOnce(cmd: string, args: string[]): Promise<RunResult> {
+  // screen(1) writes "No screen session found." to STDOUT (not stderr) — so we
+  // pipe both and merge into the same buffer for diagnostics. tmux writes its
+  // errors to stderr normally; capturing both is harmless either way.
   return new Promise((resolve) => {
+    let buf = "";
     try {
-      const child = spawn(cmd, args, { stdio: "ignore" });
+      const child = spawn(cmd, args, { stdio: ["ignore", "pipe", "pipe"] });
+      child.stdout?.on("data", (d: Buffer) => {
+        buf += d.toString("utf8");
+      });
+      child.stderr?.on("data", (d: Buffer) => {
+        buf += d.toString("utf8");
+      });
       child.on("error", (e) => {
         fileLog(`tty inject ${cmd} spawn error: ${String(e)}`);
-        resolve();
+        resolve({ code: -1, stderr: String(e) });
       });
-      child.on("exit", () => resolve());
+      child.on("exit", (code) => resolve({ code: code ?? 0, stderr: buf.trim() }));
     } catch (e) {
       fileLog(`tty inject ${cmd} threw: ${String(e)}`);
-      resolve();
+      resolve({ code: -1, stderr: String(e) });
     }
   });
 }
 
-async function injectToTTY(text: string): Promise<void> {
-  if (!CLAUDE_TTY_INJECT) return;
+type InjectResult = { ok: boolean; reason?: string };
+
+async function injectToTTY(text: string): Promise<InjectResult> {
+  if (!CLAUDE_TTY_INJECT) return { ok: true };
   const colonIdx = CLAUDE_TTY_INJECT.indexOf(":");
   if (colonIdx <= 0) {
-    fileLog(`CLAUDE_TTY_INJECT malformed (expected tool:session): ${CLAUDE_TTY_INJECT}`);
-    return;
+    const reason = `CLAUDE_TTY_INJECT malformed (expected tool:session): ${CLAUDE_TTY_INJECT}`;
+    fileLog(reason);
+    return { ok: false, reason };
   }
   const tool = CLAUDE_TTY_INJECT.slice(0, colonIdx);
   const session = CLAUDE_TTY_INJECT.slice(colonIdx + 1);
   const { body, truncated } = sanitizeForTTY(text);
-  if (!body) return;
+  if (!body) return { ok: true };
   if (truncated) {
     fileLog(`tty inject truncated to ${TTY_INJECT_MAX_BYTES} bytes (original ${Buffer.byteLength(text, "utf8")}B)`);
   }
 
   try {
     if (tool === "screen") {
-      // screen -X stuff has known buffer-size limits ("cannot paste large
-      // buffers"); we already cap body above. CR at the end submits.
-      await runOnce("screen", ["-S", session, "-X", "stuff", body + "\r"]);
+      // Two-step stuff: body first, brief settle, then CR. Mirrors the tmux
+      // path so claude-code readline never sees a bracketed-paste race where
+      // the terminating CR is absorbed as paste-end instead of submit.
+      const r1 = await runOnce("screen", ["-S", session, "-X", "stuff", body]);
+      if (r1.code !== 0) {
+        const reason = `screen -S ${session} -X stuff (body) exit=${r1.code}${r1.stderr ? ` stderr=${r1.stderr}` : ""}`;
+        fileLog(`tty inject FAILED: ${reason}`);
+        return { ok: false, reason };
+      }
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      const r2 = await runOnce("screen", ["-S", session, "-X", "stuff", "\r"]);
+      if (r2.code !== 0) {
+        const reason = `screen -S ${session} -X stuff (CR) exit=${r2.code}${r2.stderr ? ` stderr=${r2.stderr}` : ""}`;
+        fileLog(`tty inject FAILED: ${reason}`);
+        return { ok: false, reason };
+      }
+      return { ok: true };
     } else if (tool === "tmux") {
       // Two sequential send-keys: -l (literal) for the body, then Enter to
       // submit. We MUST await between them so the literal text lands before
       // Enter; otherwise tmux can process Enter first and submit empty.
-      await runOnce("tmux", ["send-keys", "-t", session, "-l", body]);
-      await runOnce("tmux", ["send-keys", "-t", session, "Enter"]);
+      const r1 = await runOnce("tmux", ["send-keys", "-t", session, "-l", body]);
+      if (r1.code !== 0) {
+        const reason = `tmux send-keys -l exit=${r1.code}${r1.stderr ? ` stderr=${r1.stderr}` : ""}`;
+        fileLog(`tty inject FAILED: ${reason}`);
+        return { ok: false, reason };
+      }
+      const r2 = await runOnce("tmux", ["send-keys", "-t", session, "Enter"]);
+      if (r2.code !== 0) {
+        const reason = `tmux send-keys Enter exit=${r2.code}${r2.stderr ? ` stderr=${r2.stderr}` : ""}`;
+        fileLog(`tty inject FAILED: ${reason}`);
+        return { ok: false, reason };
+      }
+      return { ok: true };
     } else {
-      fileLog(`CLAUDE_TTY_INJECT unsupported tool '${tool}' (expected 'screen' or 'tmux')`);
+      const reason = `unsupported tool '${tool}' (expected 'screen' or 'tmux')`;
+      fileLog(`CLAUDE_TTY_INJECT ${reason}`);
+      return { ok: false, reason };
     }
   } catch (e) {
-    fileLog(`injectToTTY exception: ${String(e)}`);
+    const reason = `injectToTTY exception: ${String(e)}`;
+    fileLog(reason);
+    return { ok: false, reason };
   }
+}
+
+// Notify the Feishu chat when TTY inject fails, with a debounce so we
+// never spam the user. One notification per chat per 5 minutes.
+const INJECT_FAILURE_NOTIFY_INTERVAL_MS = 5 * 60 * 1000;
+const injectFailureNotifiedAt = new Map<string, number>();
+
+function notifyInjectFailure(chatId: string, reason: string): void {
+  const now = Date.now();
+  const last = injectFailureNotifiedAt.get(chatId) ?? 0;
+  if (now - last < INJECT_FAILURE_NOTIFY_INTERVAL_MS) return;
+  injectFailureNotifiedAt.set(chatId, now);
+  const msg =
+    `⚠️ Feishu → Claude TTY 注入失败，你的消息没有送到 Claude prompt。\n` +
+    `target: ${CLAUDE_TTY_INJECT}\n` +
+    `reason: ${reason}\n\n` +
+    `修复：在 ssh 终端里 \`screen -S claude\`（或对应 tmux 会话），然后在那里启动 claude。`;
+  sendText(chatId, msg).catch((err) =>
+    fileLog(`notifyInjectFailure send failed: ${String(err)}`)
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -1055,7 +1166,6 @@ function cleanupOldImages(): void {
 
 // Periodic cleanup: runs every hour while the channel is active, and an
 // immediate sweep on startup so a previously-aged-out tree doesn't linger.
-let imageCleanupTimer: ReturnType<typeof setInterval> | null = null;
 function startImageCleanupLoop(): void {
   if (!FEISHU_IMAGE_ENABLED || imageCleanupTimer) return;
   cleanupOldImages();
@@ -1096,12 +1206,16 @@ async function downloadFeishuImage(
 ): Promise<string | null> {
   if (!FEISHU_IMAGE_ENABLED) return null;
   if (!messageId || !fileKey) return null;
+  if (!client) {
+    fileLog(`downloadFeishuImage skipped: lark client not initialized`);
+    return null;
+  }
   ensureImageDir();
   try {
     // SDK signature: messageResource.get(payload) -> { writeFile, getReadableStream, headers }
     // We use writeFile directly because it handles the stream-to-disk plumbing
     // and is documented to support up to 100MB resources.
-    const res: any = await larkClient.im.messageResource.get({
+    const res: any = await client.im.messageResource.get({
       path: { message_id: messageId, file_key: fileKey },
       params: { type: "image" },
     });
@@ -1149,6 +1263,54 @@ function extractImageKey(rawContent: unknown): string {
   } catch {
     return "";
   }
+}
+
+// Walk image / post content and collect every image_key.
+// image: { image_key: "..." }
+// post:  { title, content: [[{tag,...}, ...], ...] } where img nodes carry image_key
+function extractAllImageKeys(messageType: string, rawContent: unknown): string[] {
+  const raw =
+    typeof rawContent === "object" && rawContent !== null
+      ? JSON.stringify(rawContent)
+      : String(rawContent ?? "");
+  try {
+    const parsed = JSON.parse(raw);
+    if (messageType === "image") {
+      const k = String(parsed?.image_key ?? "");
+      return k ? [k] : [];
+    }
+    if (messageType === "post") {
+      // Feishu post comes in two shapes:
+      //   (a) flat:   { title, content: [[node,...], ...] }   ← what the API actually delivers
+      //   (b) locale: { zh_cn: { title, content: [...] }, ... }  ← legacy/docs shape
+      // Earlier patch only handled (b) via Object.values(parsed).find(..."content" in v),
+      // which fails on (a) because parsed.content's value is an Array and arrays don't
+      // have a "content" own-property → find returns undefined → keys=[] → no download.
+      const keys: string[] = [];
+      let paragraphs: unknown = (parsed as { content?: unknown })?.content;
+      if (!Array.isArray(paragraphs)) {
+        const localeData = Object.values(parsed).find(
+          (v): v is { content?: unknown[][] } =>
+            typeof v === "object" && v !== null && !Array.isArray(v) && "content" in v
+        );
+        paragraphs = localeData?.content;
+      }
+      if (!Array.isArray(paragraphs)) return [];
+      for (const paragraph of paragraphs) {
+        if (!Array.isArray(paragraph)) continue;
+        for (const el of paragraph) {
+          if (typeof el !== "object" || el === null) continue;
+          const node = el as Record<string, unknown>;
+          if (String(node.tag ?? "") === "img") {
+            const k = String(node.image_key ?? "");
+            if (k) keys.push(k);
+          }
+        }
+      }
+      return keys;
+    }
+  } catch {}
+  return [];
 }
 
 function formatMessageContent(messageTypeRaw: unknown, contentRaw: unknown): string {
