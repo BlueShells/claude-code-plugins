@@ -182,11 +182,57 @@ access 文件路径：`~/.claude/channels/feishu/profiles/<name>/access.json`
 
 用户可在飞书中给机器人发送 `我的id` 或 `my id` 查询自己的 open_id（此命令无需在 allowlist 中即可使用）。
 
-## 8) 权限中继（Permission Relay）
+## 8) Screen / tmux 集成（飞书与终端共享输入）
+
+Claude Code 2.1.x+ 将 Channel 消息视为旁路通知（out-of-band）：消息会在终端中出现，但**不会驱动提示词输入**，Claude 看到通知却不会响应。若要让飞书消息等同于在终端直接输入，需要启用 **TTY 注入**——插件将飞书消息以按键序列的形式注入到运行 Claude Code 的终端中。
+
+### 自动检测（推荐）
+
+在 `screen` 或 `tmux` 会话中启动 Claude Code，插件会**自动检测并启用注入**，无需额外配置：
+
+**GNU screen 示例：**
+```bash
+# 创建 screen 会话
+screen -S claude
+
+# 在 screen 会话内启动 Claude Code（$STY 由 screen 自动设置）
+FEISHU_PROFILE=my-bot claude --channels plugin:feishu@shidaxi
+
+# 插件自动检测到 screen:claude，飞书消息 ≡ 终端输入
+```
+
+**tmux 示例：**
+```bash
+# 在 tmux pane 内启动 Claude Code（$TMUX/$TMUX_PANE 由 tmux 自动设置）
+FEISHU_PROFILE=my-bot claude --channels plugin:feishu@shidaxi
+
+# 插件自动检测到当前 pane，飞书消息 ≡ 终端输入
+```
+
+启动日志会打印：`feishu channel: auto-detected screen session "claude" — TTY injection enabled`
+
+### 手动配置
+
+若自动检测不生效（例如未在 screen/tmux 内启动），可在 profile `.env` 中手动指定：
+
+```bash
+# screen 会话名为 "claude"（对应 screen -S claude）
+CLAUDE_TTY_INJECT=screen:claude
+
+# 或指定 tmux pane（TMUX_PANE 的值，如 %0）
+CLAUDE_TTY_INJECT=tmux:%0
+
+# 禁用注入（覆盖自动检测）
+CLAUDE_TTY_INJECT=
+```
+
+> **注意**：消息正文会过滤控制字符，换行转为空格，超长内容自动截断（默认 1500 字节）。
+
+## 9) 权限中继（Permission Relay）
 
 当 Claude 需要执行敏感工具调用时，会通过飞书发送交互式卡片，用户可直接在飞书中点击 "Allow" / "Deny" 按钮审批，或回复 `y <code>` / `n <code>` 文本进行审批。
 
-## 9) 环境变量参考
+## 10) 环境变量参考
 
 | 变量 | 必填 | 说明 |
 |------|------|------|
@@ -199,3 +245,7 @@ access 文件路径：`~/.claude/channels/feishu/profiles/<name>/access.json`
 | `FEISHU_DEBUG` | 否 | `true` 开启调试日志输出到 stderr |
 | `FEISHU_REACTION_EMOJI` | 否 | 已读回执 emoji，默认 `Get` |
 | `FEISHU_STATE_DIR` | 否 | 自定义状态目录（覆盖 profile 路径计算） |
+| `FEISHU_IMAGE_DIR` | 否 | 图片下载根目录，默认使用 profile 状态目录（`~/.claude/channels/feishu/profiles/<profile>`）。设为 `""` 可禁用图片下载 |
+| `FEISHU_IMAGE_TTL_HOURS` | 否 | 图片缓存保留时长（小时），默认 `24` |
+| `CLAUDE_TTY_INJECT` | 否 | TTY 注入目标，未设置时自动从 `$STY`/`$TMUX` 检测。格式：`screen:<session>` 或 `tmux:<pane>`，`""` 禁用 |
+| `FEISHU_TTY_INJECT_MAX_BYTES` | 否 | TTY 注入的最大字节数，默认 `1500` |

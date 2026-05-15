@@ -36,24 +36,41 @@ import { spawn } from "node:child_process";
 const FEISHU_PROFILE = process.env.FEISHU_PROFILE ?? "";
 const CHANNEL_ACTIVE = FEISHU_PROFILE !== "";
 
-// CLAUDE_TTY_INJECT: when set, Feishu inbound messages also get keystroke-injected
-// into the Claude Code TTY so they actually drive the prompt (not just channel
-// notifications that get rendered as side-channel events). Without this, Claude
-// Code 2.1.x channel mode treats Feishu messages as out-of-band notifications and
-// doesn't react. Format:
+// CLAUDE_TTY_INJECT: drives inbound Feishu messages into the Claude Code prompt
+// via keystroke injection into the terminal multiplexer. Required because Claude
+// Code 2.1.x+ treats channel notifications as out-of-band — they appear in the
+// terminal but do NOT drive the prompt, so Claude sees them but never responds.
+//
+// Format (when set manually):
 //   screen:<session>   e.g. screen:claude (run inside `screen -S claude`)
-//   tmux:<target>      e.g. tmux:work:0.0 or tmux:work
-//   ""                 (default) disabled — keeps prior behavior
-const CLAUDE_TTY_INJECT = process.env.CLAUDE_TTY_INJECT ?? "";
+//   tmux:<target>      e.g. tmux:%0 or tmux:work:0.0
+//   ""                 disabled
+//
+// Auto-detection (recommended): when CLAUDE_TTY_INJECT is not set in the
+// environment, the plugin auto-detects $STY (screen) or $TMUX/$TMUX_PANE (tmux)
+// and enables injection automatically. These variables are inherited from the
+// multiplexer session that launched Claude Code down to this MCP server process.
+// To disable auto-detection, explicitly set CLAUDE_TTY_INJECT="" in the profile
+// .env file.
+const CLAUDE_TTY_INJECT =
+  "CLAUDE_TTY_INJECT" in process.env
+    ? (process.env.CLAUDE_TTY_INJECT ?? "")
+    : autoDetectTTYInject();
 
-// FEISHU_IMAGE_DIR: when set, inbound image messages are downloaded to this
-// directory so Claude can Read() them. Unset = disabled (image messages keep
-// emitting "(image message)" as before — back-compat). The actual files live
-// in a plugin-owned subdirectory "feishu-channel-cache" so cleanup never
-// touches unrelated files even if the user points this at a shared root.
-const FEISHU_IMAGE_DIR_RAW = process.env.FEISHU_IMAGE_DIR ?? "";
+// FEISHU_IMAGE_DIR: base directory for downloaded Feishu images.
+// Default (when unset): the profile state directory, so images land alongside
+// logs without any configuration. Images are stored in a "feishu-channel-cache"
+// subdirectory so cleanup is always scoped and never touches unrelated files.
+// Set FEISHU_IMAGE_DIR="" explicitly to disable image download entirely.
+const _defaultImageBase =
+  process.env.FEISHU_STATE_DIR ??
+  join(homedir(), ".claude", "channels", "feishu", "profiles", FEISHU_PROFILE || "_idle");
+const FEISHU_IMAGE_DIR_RAW =
+  "FEISHU_IMAGE_DIR" in process.env
+    ? (process.env.FEISHU_IMAGE_DIR ?? "")
+    : (CHANNEL_ACTIVE ? _defaultImageBase : "");
 const FEISHU_IMAGE_ENABLED = FEISHU_IMAGE_DIR_RAW !== "";
-const FEISHU_IMAGE_DIR = FEISHU_IMAGE_DIR_RAW
+const FEISHU_IMAGE_DIR = FEISHU_IMAGE_ENABLED
   ? join(FEISHU_IMAGE_DIR_RAW, "feishu-channel-cache")
   : "";
 const FEISHU_IMAGE_TTL_HOURS = Number(process.env.FEISHU_IMAGE_TTL_HOURS ?? "24");
@@ -283,6 +300,7 @@ const mcp = new Server(
       "To send a response to Feishu users, always call the reply tool with the same chat_id.",
       "The user reads messages in Feishu, not this terminal. Plain transcript text is not delivered unless you call reply.",
       "Feishu bots cannot read full chat history in this channel; if older context is needed, ask the user to paste it.",
+      "When a message contains a local file path for a downloaded image, use the Read tool to view it before composing a reply.",
     ].join("\n"),
   }
 );
@@ -858,14 +876,59 @@ function shouldDeliver(senderId: string, allowFrom: string[], strict: boolean): 
 }
 
 // ---------------------------------------------------------------------------
-// TTY injection: optionally keystroke the inbound text into the Claude Code
-// terminal so it actually drives the prompt (vs being just a channel
-// notification that Claude only "reads" out-of-band).
+// TTY injection: keystroke inbound text into the Claude Code terminal so it
+// drives the prompt (vs being just an out-of-band channel notification).
 //
-// Limitations: the message body is best-effort plaintext. We strip control
-// characters and collapse newlines to spaces; users sending shell-meta-rich
-// text should not expect perfect fidelity. Default is disabled.
+// Auto-detection: checks $STY (GNU screen) and $TMUX/$TMUX_PANE (tmux).
+// These env vars are inherited by child processes from the multiplexer session
+// that launched Claude Code, so they are available here without extra config.
+//
+// Limitations: message body is best-effort plaintext. Control characters are
+// stripped and newlines collapsed to spaces. Large messages are truncated.
 // ---------------------------------------------------------------------------
+
+// Detect if the current process is running inside a terminal multiplexer and
+// return the CLAUDE_TTY_INJECT-format string for injecting into it.
+// Called only when CLAUDE_TTY_INJECT is not set in the environment.
+function autoDetectTTYInject(): string {
+  // GNU screen: $STY = "<pid>.<session-name>" inside any screen session.
+  // All child processes (including Claude Code and this MCP server) inherit it.
+  const sty = process.env.STY ?? "";
+  if (sty) {
+    // Extract just the session name (after the first dot).
+    const dotIdx = sty.indexOf(".");
+    const sessionName = dotIdx >= 0 ? sty.slice(dotIdx + 1) : sty;
+    process.stderr.write(
+      `feishu channel: auto-detected screen session "${sessionName}" ($STY=${sty}) — TTY injection enabled\n` +
+        `  Feishu messages will drive the Claude prompt like terminal input.\n` +
+        `  To disable: set CLAUDE_TTY_INJECT="" in the profile .env\n`
+    );
+    return `screen:${sessionName}`;
+  }
+
+  // tmux: $TMUX is set inside any tmux session; $TMUX_PANE holds the pane ID
+  // (e.g. "%0"). Both are inherited by child processes of the tmux pane.
+  const tmuxEnv = process.env.TMUX ?? "";
+  if (tmuxEnv) {
+    const pane = process.env.TMUX_PANE ?? "";
+    if (!pane) {
+      // $TMUX is set but $TMUX_PANE isn't — shouldn't happen, skip auto-detect.
+      process.stderr.write(
+        `feishu channel: $TMUX is set but $TMUX_PANE is empty — skipping TTY auto-detection\n` +
+          `  Set CLAUDE_TTY_INJECT=tmux:<target> manually to enable injection.\n`
+      );
+      return "";
+    }
+    process.stderr.write(
+      `feishu channel: auto-detected tmux pane "${pane}" — TTY injection enabled\n` +
+        `  Feishu messages will drive the Claude prompt like terminal input.\n` +
+        `  To disable: set CLAUDE_TTY_INJECT="" in the profile .env\n`
+    );
+    return `tmux:${pane}`;
+  }
+
+  return "";
+}
 const TTY_TRUNCATE_SUFFIX = " [truncated]";
 const TTY_TRUNCATE_SUFFIX_BYTES = Buffer.byteLength(TTY_TRUNCATE_SUFFIX, "utf8");
 
